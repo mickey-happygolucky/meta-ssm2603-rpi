@@ -1,0 +1,217 @@
+diff --git a/arch/arm/boot/dts/Makefile b/arch/arm/boot/dts/Makefile
+index 5612b66..c05a8ff 100644
+--- a/arch/arm/boot/dts/Makefile
++++ b/arch/arm/boot/dts/Makefile
+@@ -92,6 +92,7 @@ dtb-$(RPI_DT_OVERLAYS) += w1-gpio-overlay.dtb
+ dtb-$(RPI_DT_OVERLAYS) += w1-gpio-pullup-overlay.dtb
+ dtb-$(RPI_DT_OVERLAYS) += spi-bcm2835-overlay.dtb
+ dtb-$(RPI_DT_OVERLAYS) += mcp2515-can0-overlay.dtb
++dtb-$(RPI_DT_OVERLAYS) += rpi-ssm260x-overlay.dts
+ dtb-$(CONFIG_ARCH_BCM2835) += bcm2835-rpi-b.dtb
+ 
+ dtb-$(CONFIG_ARCH_BCM_5301X) += bcm4708-netgear-r6250.dtb
+diff --git a/arch/arm/boot/dts/rpi-ssm260x-overlay.dts b/arch/arm/boot/dts/rpi-ssm260x-overlay.dts
+new file mode 100644
+index 0000000..a3ab895
+--- /dev/null
++++ b/arch/arm/boot/dts/rpi-ssm260x-overlay.dts
+@@ -0,0 +1,39 @@
++// Definitions for RPi DAC
++/dts-v1/;
++/plugin/;
++
++/ {
++	compatible = "brcm,bcm2708";
++
++	fragment@0 {
++		target = <&sound>;
++		__overlay__ {
++			compatible = "rpi,rpi-ssm260x";
++			i2s-controller = <&i2s>;
++			status = "okay";
++		};
++	};
++
++	fragment@1 {
++		target = <&i2s>;
++		__overlay__ {
++			status = "okay";
++		};
++	};
++
++	fragment@2 {
++		target = <&i2c1>;
++		__overlay__ {
++			#address-cells = <1>;
++			#size-cells = <0>;
++			status = "okay";
++
++			ssm2603@1a {
++				#sound-dai-cells = <0>;
++				compatible = "adi,ssm2603";
++				reg = <0x1a>;
++				status = "okay";
++			};
++		};
++	};
++};
+diff --git a/sound/soc/bcm/Kconfig b/sound/soc/bcm/Kconfig
+index 003ae28..9ca3c77 100644
+--- a/sound/soc/bcm/Kconfig
++++ b/sound/soc/bcm/Kconfig
+@@ -67,3 +67,12 @@ config SND_BCM2708_SOC_IQAUDIO_DAC
+ 	select SND_SOC_PCM512x_I2C
+ 	help
+ 	  Say Y or M if you want to add support for IQaudIO-DAC.
++
++config SND_BCM2708_SOC_RPI_SSM260x
++	tristate "Support for SSM260x with RPi"
++	depends on SND_BCM2708_SOC_I2S && SND_SOC_I2C_AND_SPI
++	select SND_SOC_SSM2602_SPI if SPI_MASTER
++	select SND_SOC_SSM2602_I2C if I2C
++	help
++	  Say Y if you want to add support for the Analog Devices
++	  SSM2602 Audio Codec Add-On Card.
+diff --git a/sound/soc/bcm/Makefile b/sound/soc/bcm/Makefile
+index 883241b..617bdef 100644
+--- a/sound/soc/bcm/Makefile
++++ b/sound/soc/bcm/Makefile
+@@ -16,6 +16,7 @@ snd-soc-hifiberry-amp-objs := hifiberry_amp.o
+ snd-soc-rpi-dac-objs := rpi-dac.o
+ snd-soc-rpi-proto-objs := rpi-proto.o
+ snd-soc-iqaudio-dac-objs := iqaudio-dac.o
++snd-soc-rpi-ssm260x-objs := rpi-ssm260x.o
+ 
+ obj-$(CONFIG_SND_BCM2708_SOC_HIFIBERRY_DAC) += snd-soc-hifiberry-dac.o
+ obj-$(CONFIG_SND_BCM2708_SOC_HIFIBERRY_DACPLUS) += snd-soc-hifiberry-dacplus.o
+@@ -24,3 +25,4 @@ obj-$(CONFIG_SND_BCM2708_SOC_HIFIBERRY_AMP) += snd-soc-hifiberry-amp.o
+ obj-$(CONFIG_SND_BCM2708_SOC_RPI_DAC) += snd-soc-rpi-dac.o
+ obj-$(CONFIG_SND_BCM2708_SOC_RPI_PROTO) += snd-soc-rpi-proto.o
+ obj-$(CONFIG_SND_BCM2708_SOC_IQAUDIO_DAC) += snd-soc-iqaudio-dac.o
++obj-$(CONFIG_SND_BCM2708_SOC_RPI_SSM260x) += snd-soc-rpi-ssm260x.o
+diff --git a/sound/soc/bcm/rpi-ssm260x.c b/sound/soc/bcm/rpi-ssm260x.c
+new file mode 100644
+index 0000000..f986d6b
+--- /dev/null
++++ b/sound/soc/bcm/rpi-ssm260x.c
+@@ -0,0 +1,120 @@
++/*
++ * ASoC Driver for SSM260x with RPi
++ *
++ * Author:	Yusuke Mitsuki <mickey.happygolucky@gmail.com>
++ *		Copyright 2015
++ *
++ * Based on
++ *      ASoC Driver for RPi-DAC.
++ * 	Author:	Florian Meier <florian.meier@koalo.de>
++ *		Copyright 2013
++ *
++ * 	board driver for SSM2602 sound chip
++ *	Author:       Cliff Cai <Cliff.Cai@analog.com>
++ *
++ * This program is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU General Public License
++ * version 2 as published by the Free Software Foundation.
++ *
++ * This program is distributed in the hope that it will be useful, but
++ * WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * General Public License for more details.
++ */
++
++#include <linux/module.h>
++#include <linux/platform_device.h>
++
++#include <sound/core.h>
++#include <sound/pcm.h>
++#include <sound/pcm_params.h>
++#include <sound/soc.h>
++#include <sound/jack.h>
++#include "../codecs/ssm2602.h"
++
++static int snd_rpi_ssm260x_init(struct snd_soc_pcm_runtime *rtd)
++{
++	/*
++	 * If you are using a crystal source which frequency is not 12.288MHz
++	 * then modify the below case statement with frequency of the crystal.
++	 *
++	 * If you are using the SPORT to generate clocking then this is
++	 * where to do it.
++	 */
++	return snd_soc_dai_set_sysclk(rtd->codec_dai, SSM2602_SYSCLK, 12288000,
++                                      SND_SOC_CLOCK_IN);
++}
++
++static struct snd_soc_dai_link snd_rpi_ssm260x_dai[] = {
++    {
++        .name = "ssm2602",
++        .stream_name = "SSM2602",
++        .cpu_dai_name = "bcm2708-i2s.0",
++        .codec_dai_name = "ssm2602-hifi",
++        .platform_name = "bcm2708-i2s.0",
++        .codec_name = "ssm2602.1-001a",
++	.dai_fmt	= SND_SOC_DAIFMT_I2S | SND_SOC_DAIFMT_NB_NF |
++                          SND_SOC_DAIFMT_CBS_CFS,
++	.init		= snd_rpi_ssm260x_init,
++    },
++};
++
++/* audio machine driver */
++static struct snd_soc_card snd_rpi_ssm260x = {
++	.name         = "snd_rpi_ssm260x",
++	.dai_link     = snd_rpi_ssm260x_dai,
++	.num_links    = ARRAY_SIZE(snd_rpi_ssm260x_dai),
++};
++
++static int snd_rpi_ssm260x_probe(struct platform_device *pdev)
++{
++	int ret = 0;
++
++	snd_rpi_ssm260x.dev = &pdev->dev;
++
++	if (pdev->dev.of_node) {
++		struct device_node *i2s_node;
++		struct snd_soc_dai_link *dai = &snd_rpi_ssm260x_dai[0];
++		i2s_node = of_parse_phandle(pdev->dev.of_node, "i2s-controller", 0);
++
++		if (i2s_node) {
++			dai->cpu_dai_name = NULL;
++			dai->cpu_of_node = i2s_node;
++			dai->platform_name = NULL;
++			dai->platform_of_node = i2s_node;
++		}
++	}
++
++	ret = snd_soc_register_card(&snd_rpi_ssm260x);
++	if (ret)
++		dev_err(&pdev->dev, "snd_soc_register_card() failed: %d\n", ret);
++
++	return ret;
++}
++
++static int snd_rpi_ssm260x_remove(struct platform_device *pdev)
++{
++	return snd_soc_unregister_card(&snd_rpi_ssm260x);
++}
++
++static const struct of_device_id snd_rpi_ssm260x_of_match[] = {
++	{ .compatible = "rpi,rpi-ssm260x", },
++	{},
++};
++MODULE_DEVICE_TABLE(of, snd_rpi_ssm260x_of_match);
++
++static struct platform_driver snd_rpi_ssm260x_driver = {
++        .driver = {
++                .name   = "snd-rpi-ssm260x",
++                .owner  = THIS_MODULE,
++                .of_match_table = snd_rpi_ssm260x_of_match,
++        },
++        .probe          = snd_rpi_ssm260x_probe,
++        .remove         = snd_rpi_ssm260x_remove,
++};
++
++module_platform_driver(snd_rpi_ssm260x_driver);
++
++MODULE_AUTHOR("Yusuke Mitsuki <mickey.happygolucky@gmail.com>");
++MODULE_DESCRIPTION("ASoC Driver for SSM260x with RPi");
++MODULE_LICENSE("GPL v2");
